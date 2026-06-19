@@ -106,6 +106,52 @@ extension KVCache {
     public func prepare(lengths: MLXArray?) {}
 
     public func finalize() {}
+
+    func asQuantizableWithGroupSize(_ groupSize: Int) -> QuantizableKVCache? {
+        switch self {
+        case let simple as KVCacheSimple:
+            return simple
+        // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
+        // When implemented, add: case let rotating as RotatingKVCache...
+        default:
+            return nil
+        }
+    }
+
+    func canQuantize(at quantizedKVStart: Int, groupSize: Int) -> Bool {
+        guard let quantizable = asQuantizableWithGroupSize(groupSize) else { return false }
+
+        return quantizable.offset >= quantizedKVStart
+    }
+
+    func isValidQuantizedGroupSize(_ groupSize: Int) -> Bool {
+        guard state.count == 2 else { return false }
+        let keyHeadDim = state[0].dim(3)
+        let valueHeadDim = state[1].dim(3)
+
+        return [32, 64, 128].contains {
+            keyHeadDim.isMultiple(of: $0) && valueHeadDim.isMultiple(of: $0)
+        }
+    }
+
+    func resolvedKVQuantizationGroupSize(_ groupSize: Int, keyHeadDim: Int, valueHeadDim: Int)
+        -> Int?
+    {
+        let compatible = [32, 64, 128].filter {
+            keyHeadDim.isMultiple(of: $0) && valueHeadDim.isMultiple(of: $0)
+        }
+        guard !compatible.isEmpty else { return nil }
+        let requested = max(1, groupSize)
+
+        return compatible.min { lhs, rhs in
+            let lhsDistance = abs(lhs - requested)
+            let rhsDistance = abs(rhs - requested)
+            if lhsDistance == rhsDistance {
+                return lhs < rhs
+            }
+            return lhsDistance < rhsDistance
+        }
+    }
 }
 
 public func withPreparedCache<Result>(
@@ -125,6 +171,11 @@ public func withPreparedCache<Result>(
         }
     }
     return try body()
+}
+
+/// Protocol for caches that support conversion to quantized cache
+public protocol QuantizableKVCache: KVCache {
+    func toQuantized(groupSize: Int, bits: Int) -> QuantizedKVCache
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -369,7 +420,7 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
-public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+public class KVCacheSimple: BaseKVCache, QuantizableKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
@@ -468,7 +519,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let currentValues = values[.ellipsis, ..<offset, 0...]
             guard
                 let effectiveGroupSize = resolvedKVQuantizationGroupSize(
-                    requested: groupSize,
+                    groupSize,
                     keyHeadDim: currentKeys.dim(3),
                     valueHeadDim: currentValues.dim(3)
                 )
@@ -797,26 +848,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
-private func resolvedKVQuantizationGroupSize(
-    requested: Int,
-    keyHeadDim: Int,
-    valueHeadDim: Int
-) -> Int? {
-    let requested = max(1, requested)
-    let compatible = [32, 64, 128].filter {
-        keyHeadDim.isMultiple(of: $0) && valueHeadDim.isMultiple(of: $0)
-    }
-    guard !compatible.isEmpty else { return nil }
-    return compatible.min { lhs, rhs in
-        let lhsDistance = abs(lhs - requested)
-        let rhsDistance = abs(rhs - requested)
-        if lhsDistance == rhsDistance {
-            return lhs < rhs
-        }
-        return lhsDistance < rhsDistance
-    }
-}
-
 /// Quantized KV cache for memory efficiency using MLX quantization
 public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     private var keys: (MLXArray, MLXArray, MLXArray?)?
@@ -916,7 +947,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         let vHeadDim = values.dim(3)
         let prev = offset
         let effectiveGroupSize = resolvedKVQuantizationGroupSize(
-            requested: groupSize,
+            groupSize,
             keyHeadDim: kHeadDim,
             valueHeadDim: vHeadDim
         )
@@ -1545,6 +1576,31 @@ public class CacheList: BaseKVCache {
     }
 }
 
+public class KVCacheContainer {
+    private(set) public var cache: [KVCache] = []
+    private var canQuantize: Bool
+
+    public init(cache: [KVCache]? = nil, model: any LanguageModel, parameters: GenerateParameters) {
+        let cache = cache ?? model.newCache(parameters: parameters)
+
+        self.cache = cache
+        self.canQuantize =
+            parameters.kvBits != nil
+            && cache.contains { $0.asQuantizableWithGroupSize(parameters.kvGroupSize) != nil }
+    }
+
+    public func maybeQuantize(kvBits: Int?, kvGroupSize: Int = 64, quantizedKVStart: Int = 0) {
+        guard canQuantize else { return }
+
+        if maybeQuantizeKVCache(
+            cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart)
+        {
+            canQuantize = false
+        }
+    }
+}
+
 // MARK: - Error Types
 
 struct KVCacheError: Error {
@@ -1969,43 +2025,24 @@ public func quantizedScaledDotProductAttention(
 ///   - kvBits: Number of bits for quantization (nil = no quantization)
 ///   - kvGroupSize: Group size for quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
+/// - Returns: true if cache was quantized, otherwise false
+@discardableResult
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
     kvGroupSize: Int = 64,
     quantizedKVStart: Int = 0
-) {
-    guard let kvBits = kvBits, !cache.isEmpty else { return }
+) -> Bool {
+    guard let kvBits = kvBits, !cache.isEmpty else { return false }
+    guard cache.contains(where: { $0.canQuantize(at: quantizedKVStart, groupSize: kvGroupSize) })
+    else { return false }
 
-    // Find the first quantizable (non-Mamba, non-already-quantized) cache entry
-    guard let firstQuantizable = cache.first(where: { $0 is KVCacheSimple }),
-        !(firstQuantizable is QuantizedKVCache),
-        firstQuantizable.offset > quantizedKVStart
-    else {
-        return
+    cache = cache.map {
+        guard let quantizableCache = $0.asQuantizableWithGroupSize(kvGroupSize) else { return $0 }
+        guard quantizableCache.isValidQuantizedGroupSize(kvGroupSize) else { return $0 }
+
+        return quantizableCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
     }
 
-    for i in 0 ..< cache.count {
-        // Handle cache types that support quantization
-        if let simpleCache = cache[i] as? KVCacheSimple {
-            let state = simpleCache.state
-            if state.count == 2 {
-                let keyHeadDim = state[0].dim(3)
-                let valueHeadDim = state[1].dim(3)
-                guard
-                    resolvedKVQuantizationGroupSize(
-                        requested: kvGroupSize,
-                        keyHeadDim: keyHeadDim,
-                        valueHeadDim: valueHeadDim
-                    ) != nil
-                else {
-                    continue
-                }
-            }
-            cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
-        }
-        // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
-        // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
-        // MambaCache and CacheList don't use traditional KV quantization
-    }
+    return true
 }
