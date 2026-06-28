@@ -1485,6 +1485,22 @@ public class CacheList: BaseKVCache {
         return new
     }
 
+    /// Recursively apply a transformation to every non-composite child cache.
+    ///
+    /// `CacheList` children are descended into; any other cache is passed to
+    /// `transform` and replaced by the returned value. This is the primitive
+    /// used by dynamic cache quantization and other cache-wide rewrites for
+    /// models with hybrid attention/recurrent caches (e.g. Falcon-H1).
+    public func mapChildren(_ transform: (KVCache) -> KVCache) {
+        caches = caches.map { child in
+            if let list = child as? CacheList {
+                list.mapChildren(transform)
+                return list
+            }
+            return transform(child)
+        }
+    }
+
     public override func prepare(lengths: [Int]?) {
         caches.forEach { $0.prepare(lengths: lengths) }
     }
@@ -1589,12 +1605,14 @@ public class KVCacheContainer {
             && cache.contains { $0.asQuantizableWithGroupSize(parameters.kvGroupSize) != nil }
     }
 
-    public func maybeQuantize(kvBits: Int?, kvGroupSize: Int = 64, quantizedKVStart: Int = 0) {
+    public func maybeQuantize(
+        kvBits: Int?, kvGroupSize: Int = 64, quantizedKVStart: Int = 0, kvScheme: String? = nil
+    ) {
         guard canQuantize else { return }
 
         if maybeQuantizeKVCache(
             cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart)
+            quantizedKVStart: quantizedKVStart, kvScheme: kvScheme)
         {
             canQuantize = false
         }
@@ -2015,8 +2033,18 @@ public func quantizedScaledDotProductAttention(
 
 /// Dynamically quantize KV caches during generation if conditions are met
 ///
+/// Resolve a kvScheme string to (bits, groupSize) for affine quantization.
+/// Returns nil for unrecognized schemes (custom schemes handle their own caches).
+public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int)? {
+    switch scheme {
+    case "affine4": return (4, 64)
+    case "affine8": return (8, 64)
+    default: return nil
+    }
+}
+
 /// Converts regular caches to quantized caches when:
-/// - kvBits is specified
+/// - kvBits is specified (or kvScheme resolves to a built-in affine scheme)
 /// - The cache is not already quantized
 /// - The cache offset is greater than quantizedKVStart
 ///
@@ -2025,23 +2053,44 @@ public func quantizedScaledDotProductAttention(
 ///   - kvBits: Number of bits for quantization (nil = no quantization)
 ///   - kvGroupSize: Group size for quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
+///   - kvScheme: Scheme selector; overrides kvBits when it names a built-in
+///     affine scheme ("affine4", "affine8"). Unrecognized schemes are left to
+///     custom cache implementations and do not quantize here.
 /// - Returns: true if cache was quantized, otherwise false
 @discardableResult
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
     kvGroupSize: Int = 64,
-    quantizedKVStart: Int = 0
+    quantizedKVStart: Int = 0,
+    kvScheme: String? = nil
 ) -> Bool {
-    guard let kvBits = kvBits, !cache.isEmpty else { return false }
-    guard cache.contains(where: { $0.canQuantize(at: quantizedKVStart, groupSize: kvGroupSize) })
+    guard !cache.isEmpty else { return false }
+    // Resolve effective bits: kvScheme overrides kvBits.
+    let effectiveBits: Int
+    let effectiveGroupSize: Int
+    if let resolved = resolveAffineScheme(kvScheme) {
+        effectiveBits = resolved.bits
+        effectiveGroupSize = resolved.groupSize
+    } else if let kvBits {
+        effectiveBits = kvBits
+        effectiveGroupSize = kvGroupSize
+    } else {
+        return false
+    }
+    guard
+        cache.contains(where: {
+            $0.canQuantize(at: quantizedKVStart, groupSize: effectiveGroupSize)
+        })
     else { return false }
 
     cache = cache.map {
-        guard let quantizableCache = $0.asQuantizableWithGroupSize(kvGroupSize) else { return $0 }
-        guard quantizableCache.isValidQuantizedGroupSize(kvGroupSize) else { return $0 }
+        guard let quantizableCache = $0.asQuantizableWithGroupSize(effectiveGroupSize) else {
+            return $0
+        }
+        guard quantizableCache.isValidQuantizedGroupSize(effectiveGroupSize) else { return $0 }
 
-        return quantizableCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+        return quantizableCache.toQuantized(groupSize: effectiveGroupSize, bits: effectiveBits)
     }
 
     return true
